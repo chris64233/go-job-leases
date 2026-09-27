@@ -32,12 +32,14 @@ func WithClock(now func() time.Time) Option {
 	return func(q *Queue) { q.now = now }
 }
 
-// NewQueue 从 Store 恢复状态并返回队列。崩溃前的领取、完成、死信等状态都会还原。
+// NewQueue 从 Store 恢复状态并返回队列。崩溃前的领取、完成、死信、依赖关系、
+// 阻断原因等状态都会还原。
 func NewQueue(store Store, opts ...Option) (*Queue, error) {
 	st, err := store.Load()
 	if err != nil {
 		return nil, internalErr("load", err)
 	}
+	st.normalize()
 	q := &Queue{store: store, st: st, policy: DefaultRetryPolicy, now: time.Now}
 	for _, o := range opts {
 		o(q)
@@ -60,13 +62,35 @@ func (q *Queue) nextID(prefix string) string {
 
 // Submit 提交任务。以 TaskID 幂等：同号同负载返回已存在的任务；
 // 同号不同负载返回 KindConflict 冲突。
-func (q *Queue) Submit(taskID string, payload []byte, runAt time.Time, maxAttempts int) (*Job, error) {
+//
+// dependsOn 列出前置任务号：这些任务必须全部进入完成态，本任务才会从
+// waiting 释放为 pending 并可被领取；任一前置最终进入死信（或被级联阻断），
+// 本任务立即转为 blocked 终态并记录阻断原因。前置任务必须已经存在，
+// 依赖列表会去重（保留首次出现顺序），自依赖及任何会形成环的引用都以
+// KindCycleDependency 拒绝。
+func (q *Queue) Submit(taskID string, payload []byte, runAt time.Time, maxAttempts int, dependsOn ...string) (*Job, error) {
 	const op = "submit"
 	if taskID == "" {
 		return nil, invalidArg(op, "task id is required")
 	}
 	if maxAttempts < 1 {
 		return nil, invalidArg(op, "max attempts must be >= 1")
+	}
+	// 先做不需要持锁的去空/去重。
+	deps := make([]string, 0, len(dependsOn))
+	seen := make(map[string]bool, len(dependsOn))
+	for _, d := range dependsOn {
+		if d == "" {
+			return nil, invalidArg(op, "dependency task id must not be empty")
+		}
+		if d == taskID {
+			return nil, cycleErr(op, "task cannot depend on itself")
+		}
+		if seen[d] {
+			continue
+		}
+		seen[d] = true
+		deps = append(deps, d)
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -76,22 +100,158 @@ func (q *Queue) Submit(taskID string, payload []byte, runAt time.Time, maxAttemp
 		}
 		return existing, nil
 	}
+	for _, d := range deps {
+		if _, ok := q.st.Jobs[d]; !ok {
+			return nil, invalidArg(op, fmt.Sprintf("dependency %q does not exist", d))
+		}
+	}
+	if q.wouldCycle(taskID, deps) {
+		return nil, cycleErr(op, "dependency chain would form a cycle")
+	}
 	now := q.now()
 	job := &Job{
-		TaskID:      taskID,
-		Payload:     payload,
-		RunAt:       runAt,
-		MaxAttempts: maxAttempts,
-		Status:      StatusPending,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		TaskID:       taskID,
+		Payload:      payload,
+		RunAt:        runAt,
+		MaxAttempts:  maxAttempts,
+		Dependencies: deps,
+		Status:       StatusPending,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if len(deps) > 0 {
+		job.Unresolved = make(map[string]bool, len(deps))
+		for _, dep := range deps {
+			switch q.st.Jobs[dep].Status {
+			case StatusCompleted:
+				// 提交时前置已完成：不再占用未决集合。
+			case StatusDead, StatusBlocked:
+				// 提交时前置已是失败终态：直接阻断。
+				job.Status = StatusBlocked
+				job.BlockedReason = blockedReason(q.st.Jobs[dep], now)
+				job.Unresolved = nil
+			default:
+				job.Unresolved[dep] = true
+			}
+			if job.Status == StatusBlocked {
+				break
+			}
+		}
+		if job.Status != StatusBlocked && len(job.Unresolved) > 0 {
+			job.Status = StatusWaiting
+		}
+		if job.Status == StatusPending {
+			job.ReleasedAt = now
+		}
 	}
 	q.st.Jobs[taskID] = job
+	for _, dep := range deps {
+		q.st.Dependents[dep] = append(q.st.Dependents[dep], taskID)
+	}
 	if err := q.persist(op); err != nil {
 		delete(q.st.Jobs, taskID)
+		for _, dep := range deps {
+			q.st.Dependents[dep] = removeString(q.st.Dependents[dep], taskID)
+		}
 		return nil, err
 	}
 	return job, nil
+}
+
+// wouldCycle 判断新任务以 deps 为前置是否会在依赖图中成环（调用方持锁）：
+// 从 deps 出发沿 Dependencies 做 DFS，若能到达 taskID 则成环。
+func (q *Queue) wouldCycle(taskID string, deps []string) bool {
+	stack := append([]string(nil), deps...)
+	visited := make(map[string]bool)
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if cur == taskID {
+			return true
+		}
+		if visited[cur] {
+			continue
+		}
+		visited[cur] = true
+		if j, ok := q.st.Jobs[cur]; ok {
+			stack = append(stack, j.Dependencies...)
+		}
+	}
+	return false
+}
+
+// blockedReason 依据失败终态的上游任务构造阻断原因。
+func blockedReason(upstream *Job, now time.Time) *BlockedReason {
+	r := &BlockedReason{Upstream: upstream.TaskID, UpstreamStatus: upstream.Status, At: now}
+	switch upstream.Status {
+	case StatusBlocked:
+		if upstream.BlockedReason != nil {
+			r.Cause = upstream.BlockedReason.String()
+		} else {
+			r.Cause = "upstream is blocked"
+		}
+	default: // StatusDead
+		if upstream.LastError != "" {
+			r.Cause = upstream.LastError
+		} else {
+			r.Cause = "upstream is dead-lettered"
+		}
+	}
+	return r
+}
+
+// releaseDependents 在某个任务完成后处理其直接后继：仅处理仍处于 waiting 的
+// 后继；其未决前置全部完成时，在同一次持锁修改中转为 pending（转换只发生
+// 一次）。不跨层递归——后继的后继等待该后继真正完成后才会被释放。
+func (q *Queue) releaseDependents(completedID string, now time.Time) {
+	for _, id := range q.st.Dependents[completedID] {
+		d := q.st.Jobs[id]
+		if d.Status != StatusWaiting {
+			continue
+		}
+		if d.Unresolved != nil {
+			delete(d.Unresolved, completedID)
+		}
+		if len(d.Unresolved) > 0 {
+			continue
+		}
+		d.Status = StatusPending
+		d.Unresolved = nil
+		d.ReleasedAt = now
+		d.UpdatedAt = now
+	}
+}
+
+// cascadeBlocked 在某个任务进入 dead/blocked 终态后，把所有仍在 waiting 的
+// 直接/间接后继转为 blocked 并记录直接上游的阻断原因，逐层向下传播。
+// 每个后继只会被阻断一次：已离开 waiting（含已被别的上游阻断）的不再处理。
+func (q *Queue) cascadeBlocked(upstreamID string, now time.Time) {
+	stack := []string{upstreamID}
+	for len(stack) > 0 {
+		up := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		upJob := q.st.Jobs[up]
+		for _, id := range q.st.Dependents[up] {
+			d := q.st.Jobs[id]
+			if d.Status != StatusWaiting {
+				continue
+			}
+			d.Status = StatusBlocked
+			d.Unresolved = nil
+			d.BlockedReason = blockedReason(upJob, now)
+			d.UpdatedAt = now
+			stack = append(stack, id)
+		}
+	}
+}
+
+func removeString(xs []string, s string) []string {
+	for i, x := range xs {
+		if x == s {
+			return append(xs[:i], xs[i+1:]...)
+		}
+	}
+	return xs
 }
 
 // Claim 批量领取已到期任务。每次领取为任务发放递增的尝试号与有期限的租约，
@@ -131,6 +291,7 @@ func (q *Queue) Claim(batchSize int, leaseDuration time.Duration) ([]Lease, erro
 				j.Status = StatusDead
 				j.LastError = "attempts exhausted: lease expired"
 				j.UpdatedAt = now
+				q.cascadeBlocked(j.TaskID, now)
 				continue
 			}
 			j.Status = StatusPending
@@ -181,6 +342,8 @@ func (q *Queue) lookupActive(op, taskID string) (*Job, error) {
 		return nil, stateErr(op, "task already completed")
 	case StatusDead:
 		return nil, stateErr(op, "task is dead-lettered")
+	case StatusBlocked:
+		return nil, stateErr(op, "task is blocked by an upstream dependency")
 	}
 	return j, nil
 }
@@ -234,6 +397,9 @@ func (q *Queue) Complete(taskID, leaseID string, attempt int, result []byte) (*C
 	if j.Status == StatusDead {
 		return nil, stateErr(op, "task is dead-lettered")
 	}
+	if j.Status == StatusBlocked {
+		return nil, stateErr(op, "task is blocked by an upstream dependency")
+	}
 	now := q.now()
 	if err := checkLease(op, j, leaseID, attempt, now); err != nil {
 		return nil, err
@@ -260,6 +426,9 @@ func (q *Queue) Complete(taskID, leaseID string, attempt int, result []byte) (*C
 		Body:      body,
 		CreatedAt: now,
 	})
+	// 与完成记录同一次持锁修改释放后继：最后一个前置完成与后继转为可领取
+	// 之间不存在中间态，既不会被提前租出，也不会重复入队。
+	q.releaseDependents(taskID, now)
 	if err := q.persist(op); err != nil {
 		return nil, err
 	}
@@ -291,6 +460,9 @@ func (q *Queue) Fail(taskID, leaseID string, attempt int, cause string, retryabl
 		j.RunAt = now.Add(q.policy.Delay(attempt))
 	} else {
 		j.Status = StatusDead
+		// 死信与后继阻断同一次持锁修改：后继不会停在 waiting，
+		// 阻断原因直接指向该死信任务及其 LastError。
+		q.cascadeBlocked(taskID, now)
 	}
 	return q.persist(op)
 }
@@ -308,6 +480,15 @@ func (q *Queue) Get(taskID string) (*Job, error) {
 		return nil, notFound(op, "task not found")
 	}
 	cp := *j
+	if len(j.Dependencies) > 0 {
+		cp.Dependencies = append([]string(nil), j.Dependencies...)
+	}
+	if len(j.Unresolved) > 0 {
+		cp.Unresolved = make(map[string]bool, len(j.Unresolved))
+		for d := range j.Unresolved {
+			cp.Unresolved[d] = true
+		}
+	}
 	return &cp, nil
 }
 
@@ -318,12 +499,16 @@ func (q *Queue) Stats() Stats {
 	var s Stats
 	for _, j := range q.st.Jobs {
 		switch j.Status {
+		case StatusWaiting:
+			s.Waiting++
 		case StatusPending:
 			s.Pending++
 		case StatusLeased:
 			s.Leased++
 		case StatusCompleted:
 			s.Completed++
+		case StatusBlocked:
+			s.Blocked++
 		case StatusDead:
 			s.Dead++
 		}

@@ -12,6 +12,8 @@ const (
 	KindNotFound
 	// KindConflict 幂等冲突：相同外部任务号提交了不同的负载。
 	KindConflict
+	// KindCycleDependency 提交的依赖关系会形成循环（含自依赖）。
+	KindCycleDependency
 	// KindLeaseMismatch 租约问题：租约号/尝试号不匹配，或租约已过期（迟到操作）。
 	KindLeaseMismatch
 	// KindInvalidState 状态问题：任务已死信/已完成，不允许当前操作。
@@ -42,6 +44,7 @@ func KindOf(err error) (kind ErrorKind, ok bool) {
 func invalidArg(op, msg string) *Error { return &Error{Kind: KindInvalidArgument, Op: op, Msg: msg} }
 func notFound(op, msg string) *Error   { return &Error{Kind: KindNotFound, Op: op, Msg: msg} }
 func conflict(op, msg string) *Error   { return &Error{Kind: KindConflict, Op: op, Msg: msg} }
+func cycleErr(op, msg string) *Error   { return &Error{Kind: KindCycleDependency, Op: op, Msg: msg} }
 func leaseErr(op, msg string) *Error   { return &Error{Kind: KindLeaseMismatch, Op: op, Msg: msg} }
 func stateErr(op, msg string) *Error   { return &Error{Kind: KindInvalidState, Op: op, Msg: msg} }
 func internalErr(op string, err error) *Error {

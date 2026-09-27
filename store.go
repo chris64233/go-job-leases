@@ -15,10 +15,28 @@ type state struct {
 	Jobs   map[string]*Job `json:"jobs"` // 以外部任务号为键
 	Outbox []OutboxMessage `json:"outbox"`
 	Seq    uint64          `json:"seq"` // 单调序号，用于生成租约号与消息号
+
+	// Dependents 反向依赖索引：前置任务号 -> 直接依赖它的任务号。
+	// 不持久化，启动时与提交时从 Job.Dependencies 维护，崩溃恢复后重建即可。
+	Dependents map[string][]string `json:"-"`
 }
 
 func newState() *state {
-	return &state{Jobs: make(map[string]*Job)}
+	return &state{Jobs: make(map[string]*Job), Dependents: make(map[string][]string)}
+}
+
+// normalize 补齐内存派生结构：旧快照可能没有 Dependents 反向索引，
+// 这里从每个任务的 Dependencies 重新构建。
+func (s *state) normalize() {
+	if s.Jobs == nil {
+		s.Jobs = make(map[string]*Job)
+	}
+	s.Dependents = make(map[string][]string)
+	for id, j := range s.Jobs {
+		for _, dep := range j.Dependencies {
+			s.Dependents[dep] = append(s.Dependents[dep], id)
+		}
+	}
 }
 
 // Store 持久化队列状态。Save 必须原子生效：要么全部落盘，要么不生效。
@@ -76,9 +94,7 @@ func (f *FileStore) Load() (*state, error) {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, fmt.Errorf("jobleases: decode state: %w", err)
 	}
-	if s.Jobs == nil {
-		s.Jobs = make(map[string]*Job)
-	}
+	s.normalize()
 	return &s, nil
 }
 
