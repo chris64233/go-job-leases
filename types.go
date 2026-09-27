@@ -8,12 +8,16 @@ type JobStatus string
 const (
 	// StatusPending 待领取（含失败重排后等待到期的任务）。
 	StatusPending JobStatus = "pending"
+	// StatusWaiting 等待前置任务：全部前置完成前不可领取。
+	StatusWaiting JobStatus = "waiting"
 	// StatusLeased 已被某次尝试领取，租约有效期内不可被其他工作者领取。
 	StatusLeased JobStatus = "leased"
 	// StatusCompleted 已完成，终态。
 	StatusCompleted JobStatus = "completed"
 	// StatusDead 死信，终态：不可重试失败或尝试次数用尽。
 	StatusDead JobStatus = "dead"
+	// StatusBlocked 阻断，终态：任一前置任务死信或被阻断，阻断原因见 BlockedReason。
+	StatusBlocked JobStatus = "blocked"
 )
 
 // Job 是一条后台任务记录。同一外部任务号（TaskID）全队列唯一。
@@ -28,6 +32,12 @@ type Job struct {
 	LeaseAttempt int       `json:"lease_attempt,omitempty"`
 	LeaseExpiry  time.Time `json:"lease_expiry,omitempty"`
 	LastError    string    `json:"last_error,omitempty"`
+	// DependsOn 前置任务号（提交时规范化：排序去重）。全部完成后任务才进入待领取。
+	DependsOn []string `json:"depends_on,omitempty"`
+	// ReleasedAt 依赖全部满足、转为待领取的时间；无依赖任务等于创建时间。
+	ReleasedAt time.Time `json:"released_at,omitempty"`
+	// BlockedReason 阻断原因：哪个前置任务以何种终态失败。
+	BlockedReason string `json:"blocked_reason,omitempty"`
 	// Completion 完成记录，与 outbox 消息原子写入；完成请求重放时原样返回。
 	Completion *CompletionRecord `json:"completion,omitempty"`
 	CreatedAt  time.Time         `json:"created_at"`
@@ -64,8 +74,10 @@ type OutboxMessage struct {
 // Stats 队列状态概览。
 type Stats struct {
 	Pending       int `json:"pending"`
+	Waiting       int `json:"waiting"`
 	Leased        int `json:"leased"`
 	Completed     int `json:"completed"`
 	Dead          int `json:"dead"`
+	Blocked       int `json:"blocked"`
 	OutboxPending int `json:"outbox_pending"`
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -58,9 +59,18 @@ func (q *Queue) nextID(prefix string) string {
 	return fmt.Sprintf("%s-%d", prefix, q.st.Seq)
 }
 
-// Submit 提交任务。以 TaskID 幂等：同号同负载返回已存在的任务；
-// 同号不同负载返回 KindConflict 冲突。
+// Submit 提交无前置依赖的任务，等价于 SubmitWithDeps(..., nil)。
 func (q *Queue) Submit(taskID string, payload []byte, runAt time.Time, maxAttempts int) (*Job, error) {
+	return q.SubmitWithDeps(taskID, payload, runAt, maxAttempts, nil)
+}
+
+// SubmitWithDeps 提交任务并声明前置任务依赖。以 TaskID 幂等：同号同负载同依赖
+// 返回已存在的任务；同号不同负载或不同依赖返回 KindConflict 冲突。
+//
+// 前置任务必须已存在（KindNotFound），不允许自我依赖与循环依赖
+// （KindDependency）。提交时：任一前置已死信/被阻断则任务直接阻断并记录原因；
+// 全部前置已完成则直接可领取；否则进入等待，直到最后一个前置完成。
+func (q *Queue) SubmitWithDeps(taskID string, payload []byte, runAt time.Time, maxAttempts int, deps []string) (*Job, error) {
 	const op = "submit"
 	if taskID == "" {
 		return nil, invalidArg(op, "task id is required")
@@ -68,13 +78,25 @@ func (q *Queue) Submit(taskID string, payload []byte, runAt time.Time, maxAttemp
 	if maxAttempts < 1 {
 		return nil, invalidArg(op, "max attempts must be >= 1")
 	}
+	deps = normalizeDeps(deps)
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if existing, ok := q.st.Jobs[taskID]; ok {
-		if !bytes.Equal(existing.Payload, payload) {
-			return nil, conflict(op, "task id already exists with a different payload")
+		if !bytes.Equal(existing.Payload, payload) || !slices.Equal(existing.DependsOn, deps) {
+			return nil, conflict(op, "task id already exists with a different payload or dependencies")
 		}
 		return existing, nil
+	}
+	for _, dep := range deps {
+		if dep == taskID {
+			return nil, depErr(op, "task cannot depend on itself")
+		}
+		if _, ok := q.st.Jobs[dep]; !ok {
+			return nil, notFound(op, fmt.Sprintf("dependency %q not found", dep))
+		}
+	}
+	if reachesJob(q.st, taskID, deps) {
+		return nil, depErr(op, "dependency cycle detected")
 	}
 	now := q.now()
 	job := &Job{
@@ -82,9 +104,21 @@ func (q *Queue) Submit(taskID string, payload []byte, runAt time.Time, maxAttemp
 		Payload:     payload,
 		RunAt:       runAt,
 		MaxAttempts: maxAttempts,
-		Status:      StatusPending,
+		DependsOn:   deps,
 		CreatedAt:   now,
 		UpdatedAt:   now,
+	}
+	switch blockedBy, allDone := depStates(q.st, deps); {
+	case blockedBy != nil:
+		// 前置已终态失败：直接阻断，不进入等待。
+		job.Status = StatusBlocked
+		job.BlockedReason = blockedReason(blockedBy)
+	case allDone:
+		// 无依赖或前置已全部完成：直接可领取。
+		job.Status = StatusPending
+		job.ReleasedAt = now
+	default:
+		job.Status = StatusWaiting
 	}
 	q.st.Jobs[taskID] = job
 	if err := q.persist(op); err != nil {
@@ -92,6 +126,106 @@ func (q *Queue) Submit(taskID string, payload []byte, runAt time.Time, maxAttemp
 		return nil, err
 	}
 	return job, nil
+}
+
+// normalizeDeps 排序去重，使依赖列表可比较、可持久化。
+func normalizeDeps(deps []string) []string {
+	if len(deps) == 0 {
+		return nil
+	}
+	out := slices.Clone(deps)
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// depStates 检查前置任务状态：返回第一个已终态失败（死信/阻断）的前置，
+// 以及是否全部已完成。
+func depStates(st *state, deps []string) (blockedBy *Job, allDone bool) {
+	allDone = true
+	for _, dep := range deps {
+		j := st.Jobs[dep]
+		switch j.Status {
+		case StatusDead, StatusBlocked:
+			if blockedBy == nil {
+				blockedBy = j
+			}
+			allDone = false
+		case StatusCompleted:
+		default:
+			allDone = false
+		}
+	}
+	return blockedBy, allDone
+}
+
+// depsSatisfied 报告全部前置是否均已完成。
+func depsSatisfied(st *state, deps []string) bool {
+	for _, dep := range deps {
+		if st.Jobs[dep].Status != StatusCompleted {
+			return false
+		}
+	}
+	return true
+}
+
+// reachesJob 从 deps 出发沿依赖边遍历，检测是否能到达 taskID（循环依赖）。
+func reachesJob(st *state, taskID string, deps []string) bool {
+	seen := make(map[string]bool)
+	stack := slices.Clone(deps)
+	for len(stack) > 0 {
+		id := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if id == taskID {
+			return true
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if j, ok := st.Jobs[id]; ok {
+			stack = append(stack, j.DependsOn...)
+		}
+	}
+	return false
+}
+
+// blockedReason 生成阻断原因：哪个前置任务以何种终态失败。
+func blockedReason(dep *Job) string {
+	if dep.Status == StatusBlocked {
+		return fmt.Sprintf("dependency %q blocked: %s", dep.TaskID, dep.BlockedReason)
+	}
+	return fmt.Sprintf("dependency %q dead-lettered: %s", dep.TaskID, dep.LastError)
+}
+
+// releaseDependents 在任务完成后调用：将所有依赖已全满足的等待中后续任务
+// 转为待领取并记录释放时间。只在持锁状态、与完成同一次持久化中生效，
+// 因此多个前置并发完成时后续任务只会转换一次。
+func (q *Queue) releaseDependents(completed *Job, now time.Time) {
+	for _, j := range q.st.Jobs {
+		if j.Status != StatusWaiting || !slices.Contains(j.DependsOn, completed.TaskID) {
+			continue
+		}
+		if depsSatisfied(q.st, j.DependsOn) {
+			j.Status = StatusPending
+			j.ReleasedAt = now
+			j.UpdatedAt = now
+		}
+	}
+}
+
+// blockDependents 在任务进入死信/阻断时调用：递归阻断仍在等待的后续任务
+// 并记录原因。已可领取/进行中的后续任务不受影响（其前置当时已满足）。
+func (q *Queue) blockDependents(failed *Job, now time.Time) {
+	reason := blockedReason(failed)
+	for _, j := range q.st.Jobs {
+		if j.Status != StatusWaiting || !slices.Contains(j.DependsOn, failed.TaskID) {
+			continue
+		}
+		j.Status = StatusBlocked
+		j.BlockedReason = reason
+		j.UpdatedAt = now
+		q.blockDependents(j, now)
+	}
 }
 
 // Claim 批量领取已到期任务。每次领取为任务发放递增的尝试号与有期限的租约，
@@ -131,6 +265,7 @@ func (q *Queue) Claim(batchSize int, leaseDuration time.Duration) ([]Lease, erro
 				j.Status = StatusDead
 				j.LastError = "attempts exhausted: lease expired"
 				j.UpdatedAt = now
+				q.blockDependents(j, now)
 				continue
 			}
 			j.Status = StatusPending
@@ -181,6 +316,8 @@ func (q *Queue) lookupActive(op, taskID string) (*Job, error) {
 		return nil, stateErr(op, "task already completed")
 	case StatusDead:
 		return nil, stateErr(op, "task is dead-lettered")
+	case StatusBlocked:
+		return nil, stateErr(op, "task is blocked by a failed dependency")
 	}
 	return j, nil
 }
@@ -234,6 +371,9 @@ func (q *Queue) Complete(taskID, leaseID string, attempt int, result []byte) (*C
 	if j.Status == StatusDead {
 		return nil, stateErr(op, "task is dead-lettered")
 	}
+	if j.Status == StatusBlocked {
+		return nil, stateErr(op, "task is blocked by a failed dependency")
+	}
 	now := q.now()
 	if err := checkLease(op, j, leaseID, attempt, now); err != nil {
 		return nil, err
@@ -260,6 +400,8 @@ func (q *Queue) Complete(taskID, leaseID string, attempt int, result []byte) (*C
 		Body:      body,
 		CreatedAt: now,
 	})
+	// 与完成同一次持锁修改中原子释放依赖已满足的后续任务。
+	q.releaseDependents(j, now)
 	if err := q.persist(op); err != nil {
 		return nil, err
 	}
@@ -291,6 +433,7 @@ func (q *Queue) Fail(taskID, leaseID string, attempt int, cause string, retryabl
 		j.RunAt = now.Add(q.policy.Delay(attempt))
 	} else {
 		j.Status = StatusDead
+		q.blockDependents(j, now)
 	}
 	return q.persist(op)
 }
@@ -308,6 +451,7 @@ func (q *Queue) Get(taskID string) (*Job, error) {
 		return nil, notFound(op, "task not found")
 	}
 	cp := *j
+	cp.DependsOn = slices.Clone(j.DependsOn)
 	return &cp, nil
 }
 
@@ -320,12 +464,16 @@ func (q *Queue) Stats() Stats {
 		switch j.Status {
 		case StatusPending:
 			s.Pending++
+		case StatusWaiting:
+			s.Waiting++
 		case StatusLeased:
 			s.Leased++
 		case StatusCompleted:
 			s.Completed++
 		case StatusDead:
 			s.Dead++
+		case StatusBlocked:
+			s.Blocked++
 		}
 	}
 	s.OutboxPending = len(q.st.Outbox)

@@ -16,6 +16,8 @@ const (
 	KindLeaseMismatch
 	// KindInvalidState 状态问题：任务已死信/已完成，不允许当前操作。
 	KindInvalidState
+	// KindDependency 依赖问题：前置任务不存在、自我依赖或循环依赖。
+	KindDependency
 	// KindInternal 持久化等内部错误。
 	KindInternal
 )
@@ -44,6 +46,7 @@ func notFound(op, msg string) *Error   { return &Error{Kind: KindNotFound, Op: o
 func conflict(op, msg string) *Error   { return &Error{Kind: KindConflict, Op: op, Msg: msg} }
 func leaseErr(op, msg string) *Error   { return &Error{Kind: KindLeaseMismatch, Op: op, Msg: msg} }
 func stateErr(op, msg string) *Error   { return &Error{Kind: KindInvalidState, Op: op, Msg: msg} }
+func depErr(op, msg string) *Error     { return &Error{Kind: KindDependency, Op: op, Msg: msg} }
 func internalErr(op string, err error) *Error {
 	return &Error{Kind: KindInternal, Op: op, Msg: err.Error()}
 }

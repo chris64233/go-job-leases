@@ -18,6 +18,13 @@
   rename 原子替换）再返回，进程崩溃后从 `FileStore` 重建队列即可恢复。
 - **完成 + outbox 原子写入**：业务完成记录与待通知 outbox 消息在同一次持锁
   修改中写入并一起持久化。完成请求重放时返回首次的完成记录，不重复通知。
+- **前置任务依赖**：`SubmitWithDeps` 可引用已存在的前置任务（不存在返回
+  `KindNotFound`，自我依赖/循环依赖返回 `KindDependency`）。全部前置完成前
+  任务处于 `waiting` 不可领取；最后一个前置完成时，在同一次持锁修改中原子
+  转为 `pending` 并记录 `ReleasedAt`——多个前置并发完成也只转换一次，不会
+  提前租出或重复入队。任一前置死信（含租约过期耗尽）或被阻断时，等待中的
+  后续任务转为终态 `blocked` 并记录 `BlockedReason`（级联阻断），不会永远
+  停留在等待中。依赖关系、阻断原因与释放时间均随任务持久化，重启后恢复。
 - **迟到操作防护**：心跳、完成、失败都必须携带当前租约号与尝试号。租约过期后
   的迟到完成返回 `KindLeaseMismatch`，不会覆盖正在进行的新尝试。
 
@@ -29,6 +36,9 @@ q, _ := jobleases.NewQueue(store) // 崩溃后重新调用即恢复
 
 // 提交（幂等）
 q.Submit("order-123", payload, runAt, 3 /* maxAttempts */)
+
+// 提交带前置依赖的任务：全部前置完成后才可领取
+q.SubmitWithDeps("notify-123", payload, runAt, 3, []string{"order-123", "charge-123"})
 
 // 领取（批量，带租约）
 leases, _ := q.Claim(10, 30*time.Second)
@@ -55,7 +65,8 @@ q.AckOutbox(id) // 通知投递成功后确认
 | `KindNotFound` | 任务或 outbox 消息不存在 |
 | `KindConflict` | 幂等冲突：同任务号不同负载 |
 | `KindLeaseMismatch` | 租约号/尝试号不匹配，或租约已过期（迟到操作） |
-| `KindInvalidState` | 任务已是终态（完成/死信） |
+| `KindInvalidState` | 任务已是终态（完成/死信/阻断） |
+| `KindDependency` | 依赖问题：自我依赖或循环依赖 |
 | `KindInternal` | 持久化等内部错误 |
 
 ## 持久化
@@ -71,4 +82,5 @@ q.AckOutbox(id) // 通知投递成功后确认
 
 覆盖：提交幂等与冲突、到期/租约排除、并发领取不重复、心跳续租与迟到拒绝、
 完成 + outbox 原子性与重放、迟到完成不覆盖新尝试、重试重排与死信、
-崩溃恢复（FileStore 重建）、统计与 outbox 确认。
+崩溃恢复（FileStore 重建）、统计与 outbox 确认、前置依赖（等待/释放/
+阻断级联/并发完成只释放一次/依赖校验/重启恢复）。
